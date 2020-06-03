@@ -42,6 +42,7 @@ except ImportError:
 DEFAULT_CAMERA_XYZRPY_OFFSET_GEPETTO = np.array([7.5, 0.0,     1.4,
                                                  1.4, 0.0, np.pi/2])
 
+capture_it = 0
 
 def sleep(dt):
     """
@@ -457,7 +458,7 @@ class Viewer:
 
     def captureFrame(self):
         if Viewer.backend == 'gepetto-gui':
-            png_path = next(tempfile._get_candidate_names())
+            png_path = tempfile._get_default_tempdir() / next(tempfile._get_candidate_names())
             self._client.captureFrame(self._window_id, png_path)
             rgb_array = np.array(Image.open(png_path))[:, :, :-1]
             os.remove(png_path)
@@ -504,7 +505,7 @@ class Viewer:
                 self._client.viewer[\
                     self._getViewerNodeName(visual, pin.GeometryType.VISUAL)].set_transform(T)
 
-    def display(self, evolution_robot, replay_speed, xyz_offset=None):
+    def display(self, evolution_robot, replay_speed, xyz_offset=None, is_capture=False):
         t = [s.t for s in evolution_robot]
         i = 0
         init_time = time.time()
@@ -515,17 +516,29 @@ class Viewer:
                 q[:3] += xyz_offset
             else:
                 q = s.q
-                try:
+            try:
+                if Viewer.backend == 'gepetto-gui':
                     with self._lock:
                         self._rb.display(q)
-                except Viewer._backend_exception:
-                    break
+                else:
+                    self._rb.display(q)
+            except Viewer._backend_exception:
+                break
             t_simu = (time.time() - init_time) * replay_speed
             i = bisect_right(t, t_simu)
             sleep(s.t - t_simu)
 
+    def capture(self, n_iterations, fps, replay_speed):
+        stride = 1000 // fps
+        j = 0
+        for i in range(0, n_iterations, stride):
+            init_time = time.time()
+            self._client.captureFrame(
+                self._window_id, '/src/patient_interaction_' + str(format(j, '06d')) + '.png')
+            j += 1
+            sleep((0.001 * stride / replay_speed - (time.time() - init_time)))
 
-def extract_viewer_data_from_log(log_data, robot):
+def extract_viewer_data_from_log(log_data, robot, patient=None):
     """
     @brief      Extract the minimal required information from raw log data in
                 order to replay the simulation in a viewer.
@@ -543,39 +556,40 @@ def extract_viewer_data_from_log(log_data, robot):
                 The other fields are additional information.
     """
 
-    # Get the current robot model options
-    model_options = robot.get_model_options()
+    viewer_data = []
 
-    # Extract the joint positions time evolution
     t = log_data["Global.Time"]
-    try:
-        qe = np.stack([log_data["HighLevelController." + s]
-                       for s in robot.logfile_position_headers], axis=-1)
-    except:
-        model_options['dynamics']['enableFlexibleModel'] = not robot.is_flexible
-        robot.set_model_options(model_options)
-        qe = np.stack([log_data["HighLevelController." + s]
-                       for s in robot.logfile_position_headers], axis=-1)
 
-    # Determine whether the theoretical model of the flexible one must be used
-    use_theoretical_model = not robot.is_flexible
-
-    # Make sure that the flexibilities are enabled
-    model_options['dynamics']['enableFlexibleModel'] = True
-    robot.set_model_options(model_options)
-
-    # Create state sequence
+    # Extract the joint positions time evolution and create state sequence for Robot.
+    qe = np.stack([log_data["HighLevelController.Robot." + s]
+                   for s in robot.logfile_position_headers], axis=-1)
     evolution_robot = []
     for i in range(len(t)):
         evolution_robot.append(State(t=t[i], q=qe[i]))
 
-    return {'evolution_robot': evolution_robot,
-            'robot': robot,
-            'use_theoretical_model': use_theoretical_model}
+    viewer_data.append({'evolution_robot': evolution_robot,
+                        'robot': robot,
+                        'use_theoretical_model': True})
+
+    # Extract the joint positions time evolution and create state sequence for patient.
+    if patient is not None:
+        qe = np.stack([log_data["HighLevelController.patient." + s]
+                       for s in patient.logfile_position_headers], axis=-1)
+        evolution_patient = []
+        for i in range(len(t)):
+            evolution_patient.append(State(t=t[i], q=qe[i]))
+
+        viewer_data.append({'evolution_robot': evolution_patient,
+                            'robot': patient,
+                            'use_theoretical_model': True})
+
+    return viewer_data
+
 
 def play_trajectories(trajectory_data, mesh_root_path=None, replay_speed=1.0,
                       start_paused=False, camera_xyzrpy=None, xyz_offset=None, urdf_rgba=None,
-                      backend=None, window_name='python-pinocchio', scene_name='world', close_backend=None):
+                      backend=None, window_name='python-pinocchio', scene_name='world', close_backend=None,
+                      start_delay=0.):
     """!
     @brief      Display a robot trajectory in a viewer.
 
@@ -605,45 +619,54 @@ def play_trajectories(trajectory_data, mesh_root_path=None, replay_speed=1.0,
         # Close backend if it was not available beforehand
         close_backend = Viewer._backend_obj is None
 
+    if (xyz_offset is None):
+        xyz_offset = len(trajectory_data) * (None,)
+
     # Load robots in gepetto viewer
     lock = Lock()
     viewers = []
-    for i in range(len(trajectory_data)):
-        robot = trajectory_data[i]['robot']
-        robot_name = "_".join(("robot",  str(i)))
-        use_theoretical_model = trajectory_data[i]['use_theoretical_model']
-        viewer = Viewer(robot, use_theoretical_model=use_theoretical_model, mesh_root_path = mesh_root_path,
-                        urdf_rgba=urdf_rgba[i] if urdf_rgba is not None else None, robot_name=robot_name,
-                        lock=lock, backend=backend, window_name=window_name, scene_name=scene_name)
-        if (xyz_offset is not None and xyz_offset[i] is not None):
-            q = trajectory_data[i]['evolution_robot'][0].q.copy()
-            q[:3] += xyz_offset[i]
-        else:
-            q = trajectory_data[i]['evolution_robot'][0].q
-        try:
-            viewer._rb.display(q)
-        except Viewer._backend_exception:
-            break
-        viewers.append(viewer)
+    threads = []
+    for i in range(len(trajectory_data)):  # Iterate over log files.
+        for j in range(len(trajectory_data[i])):
+            robot = trajectory_data[i][j]['robot']
+            robot_name = 'robot_logfile_' + str(i) + '_system_' + str(j)
+            use_theoretical_model = trajectory_data[i][j]['use_theoretical_model']
+            viewer = Viewer(robot, use_theoretical_model=use_theoretical_model, mesh_root_path = mesh_root_path,
+                            urdf_rgba=urdf_rgba[i] if urdf_rgba is not None else None, robot_name=robot_name,
+                            lock=lock, backend=backend, window_name=window_name, scene_name=scene_name)
+            if (xyz_offset is not None and xyz_offset[i] is not None):
+                q = trajectory_data[i][j]['evolution_robot'][0].q.copy()
+                q[:3] += xyz_offset[i]
+            else:
+                q = trajectory_data[i][j]['evolution_robot'][0].q
+            try:
+                viewer._rb.display(q)
+            except Viewer._backend_exception:
+                break
+            viewers.append(viewer)
+            threads.append(Thread(target=viewer.display,
+                                  args=(trajectory_data[i][j]['evolution_robot'],
+                                        replay_speed, xyz_offset[i])))
 
     if camera_xyzrpy is not None:
         viewers[0].setCameraTransform(translation=camera_xyzrpy[:3],
                                       rotation=camera_xyzrpy[3:])
 
-    if (xyz_offset is None):
-        xyz_offset = len(trajectory_data) * (None,)
-
     if start_paused and not Viewer._is_notebook():
         input("Press Enter to continue...")
 
-    threads = []
-    for i in range(len(trajectory_data)):
-        threads.append(Thread(target=viewers[i].display,
-                              args=(trajectory_data[i]['evolution_robot'],
-                                    replay_speed, xyz_offset[i])))
-    for i in range(len(trajectory_data)):
+    capture_iterations = max([0, int(start_delay) * (len(threads) // 2 - 1) * 1000]) + \
+                         len(trajectory_data[-1][0]['evolution_robot']) + 4000
+    fps = 25
+    thread_capture = Thread(target=viewer.capture, args=(capture_iterations, fps, replay_speed))
+    thread_capture.start()
+
+    for i in range(len(threads)):
         threads[i].start()
-    for i in range(len(trajectory_data)):
+        if i % 2 == 1:
+            sleep(start_delay / replay_speed)
+    thread_capture.join()
+    for i in range(len(threads)):
         threads[i].join()
 
     if close_backend:
